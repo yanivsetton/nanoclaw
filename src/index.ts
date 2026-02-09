@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { exec, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -24,10 +25,20 @@ import {
 import {
   AvailableGroup,
   ContainerOutput,
+  CONTAINER_RUNTIME,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import {
+  extractTelegramChatId,
+  isTelegramJid,
+  sendTelegramMessage,
+  sendTelegramVoiceMessage,
+  shouldReplyWithVoice,
+  startTelegramBot,
+  stopTelegramBot,
+} from './telegram.js';
 import {
   createTask,
   deleteTask,
@@ -57,7 +68,7 @@ import { logger } from './logger.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-let sock: WASocket;
+let sock: WASocket | null = null;
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
@@ -90,6 +101,7 @@ function translateJid(jid: string): string {
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
+  if (!sock || isTelegramJid(jid)) return;
   try {
     await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
   } catch (err) {
@@ -158,6 +170,7 @@ async function syncGroupMetadata(force = false): Promise<void> {
 
   try {
     logger.info('Syncing group metadata from WhatsApp...');
+    if (!sock) return;
     const groups = await sock.groupFetchAllParticipating();
 
     let count = 0;
@@ -387,7 +400,21 @@ async function sendMessage(jid: string, text: string): Promise<void> {
     return;
   }
   try {
-    await sock.sendMessage(jid, { text });
+    if (isTelegramJid(jid)) {
+      const chatId = extractTelegramChatId(jid);
+      if (shouldReplyWithVoice(chatId)) {
+        // Strip "Andy: " prefix for TTS — the voice doesn't need to say its name
+        const voiceText = text.replace(new RegExp(`^${ASSISTANT_NAME}:\\s*`), '');
+        await sendTelegramVoiceMessage(chatId, voiceText);
+      } else {
+        await sendTelegramMessage(chatId, text);
+      }
+    } else if (sock) {
+      await sock.sendMessage(jid, { text });
+    } else {
+      logger.warn({ jid }, 'Cannot send WhatsApp message: not connected');
+      return;
+    }
     logger.info({ jid, length: text.length }, 'Message sent');
   } catch (err) {
     // If send fails, queue it for retry on reconnect
@@ -758,7 +785,21 @@ async function processTaskIpc(
   }
 }
 
+/**
+ * Check if WhatsApp auth credentials exist.
+ */
+function hasWhatsAppAuth(): boolean {
+  const authDir = path.join(STORE_DIR, 'auth');
+  const credsFile = path.join(authDir, 'creds.json');
+  return fs.existsSync(credsFile);
+}
+
 async function connectWhatsApp(): Promise<void> {
+  if (!hasWhatsAppAuth()) {
+    logger.info('No WhatsApp auth found. Skipping WhatsApp connection. Run /setup to authenticate.');
+    return;
+  }
+
   const authDir = path.join(STORE_DIR, 'auth');
   fs.mkdirSync(authDir, { recursive: true });
 
@@ -778,13 +819,9 @@ async function connectWhatsApp(): Promise<void> {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      const msg =
-        'WhatsApp authentication required. Run /setup in Claude Code.';
-      logger.error(msg);
-      exec(
-        `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
-      );
-      setTimeout(() => process.exit(1), 1000);
+      logger.warn('WhatsApp requires re-authentication. Run /setup in Claude Code.');
+      // Don't crash — just log and skip WhatsApp
+      return;
     }
 
     if (connection === 'close') {
@@ -804,15 +841,14 @@ async function connectWhatsApp(): Promise<void> {
           }, 5000);
         });
       } else {
-        logger.info('Logged out. Run /setup to re-authenticate.');
-        process.exit(0);
+        logger.info('WhatsApp logged out. Run /setup to re-authenticate.');
       }
     } else if (connection === 'open') {
       waConnected = true;
       logger.info('Connected to WhatsApp');
 
       // Build LID to phone mapping from auth state for self-chat translation
-      if (sock.user) {
+      if (sock?.user) {
         const phoneUser = sock.user.id.split(':')[0];
         const lidUser = sock.user.lid?.split(':')[0];
         if (lidUser && phoneUser) {
@@ -839,24 +875,13 @@ async function connectWhatsApp(): Promise<void> {
           );
         }, GROUP_SYNC_INTERVAL_MS);
       }
-      startSchedulerLoop({
-        registeredGroups: () => registeredGroups,
-        getSessions: () => sessions,
-        queue,
-        onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
-        sendMessage,
-        assistantName: ASSISTANT_NAME,
-      });
-      startIpcWatcher();
-      queue.setProcessMessagesFn(processGroupMessages);
-      recoverPendingMessages();
-      startMessageLoop();
+      // Core loops are started in main() so they work with all channels (WhatsApp + Telegram)
     }
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', ({ messages }) => {
+  sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
       const rawJid = msg.key.remoteJid;
@@ -874,12 +899,30 @@ async function connectWhatsApp(): Promise<void> {
 
       // Only store full message content for registered groups
       if (registeredGroups[chatJid]) {
-        storeMessage(
-          msg,
-          chatJid,
-          msg.key.fromMe || false,
-          msg.pushName || undefined,
-        );
+        // Check if this is a voice message and transcribe it
+        if (msg.message.audioMessage?.ptt && sock) {
+          try {
+            const { transcribeAudioMessage } = await import('./transcription.js');
+            const transcript = await transcribeAudioMessage(msg, sock);
+
+            if (transcript) {
+              storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined, `[Voice: ${transcript}]`);
+              logger.info({ chatJid, length: transcript.length }, 'Transcribed voice message');
+            } else {
+              storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined, '[Voice Message - transcription unavailable]');
+            }
+          } catch (err) {
+            logger.error({ err }, 'Voice transcription error');
+            storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined, '[Voice Message - transcription failed]');
+          }
+        } else {
+          storeMessage(
+            msg,
+            chatJid,
+            msg.key.fromMe || false,
+            msg.pushName || undefined,
+          );
+        }
       }
     }
   });
@@ -989,64 +1032,75 @@ function recoverPendingMessages(): void {
 }
 
 function ensureContainerSystemRunning(): void {
-  try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
+  logger.info({ runtime: CONTAINER_RUNTIME }, 'Using container runtime');
+
+  if (CONTAINER_RUNTIME === 'container') {
+    // Apple Container requires explicit system start
     try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
+      execSync('container system status', { stdio: 'pipe' });
+      logger.debug('Apple Container system already running');
+    } catch {
+      logger.info('Starting Apple Container system...');
+      try {
+        execSync('container system start', { stdio: 'pipe', timeout: 30000 });
+        logger.info('Apple Container system started');
+      } catch (err) {
+        logger.error({ err }, 'Failed to start Apple Container system');
+        throw new Error('Apple Container system is required but failed to start');
+      }
+    }
+  } else {
+    // Docker: verify daemon is running
+    try {
+      execSync('docker info', { stdio: 'pipe' });
+      logger.debug('Docker daemon is running');
     } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
-      );
-      console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
-      );
-      console.error(
-        '║  2. Run: container system start                               ║',
-      );
-      console.error(
-        '║  3. Restart NanoClaw                                          ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but failed to start');
+      logger.error({ err }, 'Docker daemon is not running');
+      throw new Error('Docker daemon is required but not running. Start Docker and try again.');
     }
   }
 
   // Kill and clean up orphaned NanoClaw containers from previous runs
-  try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
-    const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
-    for (const name of orphans) {
-      try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
-      } catch { /* already stopped */ }
+  if (CONTAINER_RUNTIME === 'container') {
+    // Apple Container: use JSON format to identify running orphans
+    try {
+      const output = execSync('container ls --format json', {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      });
+      const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
+      const orphans = containers
+        .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
+        .map((c) => c.configuration.id);
+      for (const name of orphans) {
+        try {
+          execSync(`container stop ${name}`, { stdio: 'pipe' });
+        } catch { /* already stopped */ }
+      }
+      if (orphans.length > 0) {
+        logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to clean up orphaned containers');
     }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
+  } else {
+    // Docker: clean up stopped NanoClaw containers
+    try {
+      const output = execSync(`${CONTAINER_RUNTIME} ps -a --format {{.Names}}`, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      });
+      const stale = output
+        .split('\n')
+        .map((n) => n.trim())
+        .filter((n) => n.startsWith('nanoclaw-'));
+      if (stale.length > 0) {
+        execSync(`${CONTAINER_RUNTIME} rm ${stale.join(' ')}`, { stdio: 'pipe' });
+        logger.info({ count: stale.length }, 'Cleaned up stopped containers');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Failed to clean up stopped containers');
     }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
   }
 }
 
@@ -1059,12 +1113,43 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopTelegramBot();
     await queue.shutdown(10000);
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
+  // Start core loops (these work for all channels)
+  startSchedulerLoop({
+    registeredGroups: () => registeredGroups,
+    getSessions: () => sessions,
+    queue,
+    onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    sendMessage,
+    assistantName: ASSISTANT_NAME,
+  });
+  startIpcWatcher();
+  queue.setProcessMessagesFn(processGroupMessages);
+  recoverPendingMessages();
+  startMessageLoop();
+
+  // Start Telegram bot if token is configured
+  const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (telegramToken) {
+    await startTelegramBot(telegramToken, {
+      registeredGroups: () => registeredGroups,
+      onMessage: (chatJid: string) => {
+        if (registeredGroups[chatJid]) {
+          queue.enqueueMessageCheck(chatJid);
+        }
+      },
+    });
+  } else {
+    logger.info('No TELEGRAM_BOT_TOKEN configured, skipping Telegram');
+  }
+
+  // Connect WhatsApp if authenticated (optional)
   await connectWhatsApp();
 }
 

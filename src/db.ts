@@ -208,14 +208,17 @@ export function storeMessage(
   chatJid: string,
   isFromMe: boolean,
   pushName?: string,
+  transcribedContent?: string,
 ): void {
   if (!msg.key) return;
 
   const content =
+    transcribedContent ||
     msg.message?.conversation ||
     msg.message?.extendedTextMessage?.text ||
     msg.message?.imageMessage?.caption ||
     msg.message?.videoMessage?.caption ||
+    (msg.message?.audioMessage?.ptt ? '[Voice Message]' : '') ||
     '';
 
   const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
@@ -234,6 +237,23 @@ export function storeMessage(
     timestamp,
     isFromMe ? 1 : 0,
   );
+}
+
+/**
+ * Store a message from any channel (Telegram, etc.) without WhatsApp proto dependency.
+ */
+export function storeMessageDirect(
+  msgId: string,
+  chatJid: string,
+  sender: string,
+  senderName: string,
+  content: string,
+  timestamp: string,
+  isFromMe: boolean,
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(msgId, chatJid, sender, senderName, content, timestamp, isFromMe ? 1 : 0);
 }
 
 export function getNewMessages(

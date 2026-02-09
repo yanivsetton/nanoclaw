@@ -1,8 +1,8 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in Docker or Apple Container and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -17,6 +17,28 @@ import {
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+/**
+ * Detect the available container runtime.
+ * Prefers Docker if available and running, falls back to Apple Container.
+ */
+function detectContainerRuntime(): 'docker' | 'container' {
+  try {
+    execSync('docker info', { stdio: 'pipe' });
+    return 'docker';
+  } catch {
+    // Docker not available or not running
+  }
+  try {
+    execSync('container --version', { stdio: 'pipe' });
+    return 'container';
+  } catch {
+    // Apple Container not available
+  }
+  throw new Error('No container runtime found. Install Docker or Apple Container.');
+}
+
+export const CONTAINER_RUNTIME = detectContainerRuntime();
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -192,6 +214,47 @@ function buildVolumeMounts(
     readonly: true,
   });
 
+  // MCP servers config (read-only)
+  const mcpConfigFile = path.join(DATA_DIR, 'mcp-servers.json');
+  if (fs.existsSync(mcpConfigFile)) {
+    const mcpDir = path.join(DATA_DIR, 'mcp');
+    fs.mkdirSync(mcpDir, { recursive: true });
+    fs.copyFileSync(mcpConfigFile, path.join(mcpDir, 'mcp-servers.json'));
+    mounts.push({
+      hostPath: mcpDir,
+      containerPath: '/workspace/mcp',
+      readonly: true,
+    });
+  }
+
+  // Google Workspace MCP credentials (Drive + Gmail + Calendar)
+  const workspaceMcpDir = path.join(homeDir, '.google_workspace_mcp');
+  if (fs.existsSync(workspaceMcpDir)) {
+    mounts.push({
+      hostPath: workspaceMcpDir,
+      containerPath: '/home/node/.google_workspace_mcp',
+      readonly: false,  // MCP needs to refresh tokens
+    });
+  }
+
+  // Persistent npm cache (so npx MCP servers don't re-download every run)
+  const npmCacheDir = path.join(DATA_DIR, 'npm-cache');
+  fs.mkdirSync(npmCacheDir, { recursive: true });
+  mounts.push({
+    hostPath: npmCacheDir,
+    containerPath: '/home/node/.npm',
+    readonly: false,
+  });
+
+  // Persistent uv cache (so uvx MCP servers don't re-download every run)
+  const uvCacheDir = path.join(DATA_DIR, 'uv-cache');
+  fs.mkdirSync(uvCacheDir, { recursive: true });
+  mounts.push({
+    hostPath: uvCacheDir,
+    containerPath: '/home/node/.cache/uv',
+    readonly: false,
+  });
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -208,7 +271,6 @@ function buildVolumeMounts(
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Apple Container: --mount for readonly, -v for read-write
   for (const mount of mounts) {
     if (mount.readonly) {
       args.push(
@@ -268,7 +330,7 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = spawn(CONTAINER_RUNTIME, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -367,7 +429,8 @@ export async function runContainerAgent(
     const killOnTimeout = () => {
       timedOut = true;
       logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
-      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+      // Graceful stop: sends SIGTERM, waits, then SIGKILL — lets --rm fire
+      exec(`${CONTAINER_RUNTIME} stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');

@@ -334,6 +334,8 @@ async function runQuery(
   mcpServerPath: string,
   containerInput: ContainerInput,
   resumeAt?: string,
+  externalMcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>,
+  externalMcpToolPatterns?: string[],
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
   stream.push(prompt);
@@ -388,7 +390,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        ...(externalMcpToolPatterns || []),
       ],
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -403,6 +406,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...(externalMcpServers || {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }]
@@ -463,6 +467,32 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
+  // Load external MCP server configs filtered by group
+  const externalMcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {};
+  const externalMcpToolPatterns: string[] = [];
+  const mcpConfigPath = '/workspace/mcp/mcp-servers.json';
+  if (fs.existsSync(mcpConfigPath)) {
+    try {
+      const mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf-8'));
+      const servers = mcpConfig.servers || {};
+      for (const [name, config] of Object.entries(servers) as [string, { command: string; args?: string[]; env?: Record<string, string>; groups?: string[] }][]) {
+        // Filter by group: if groups is defined and non-empty, only include if current group matches
+        if (config.groups && config.groups.length > 0 && !config.groups.includes(containerInput.groupFolder)) {
+          continue;
+        }
+        externalMcpServers[name] = {
+          command: config.command,
+          ...(config.args && { args: config.args }),
+          ...(config.env && { env: config.env }),
+        };
+        externalMcpToolPatterns.push(`mcp__${name}__*`);
+        log(`MCP server "${name}" enabled for group ${containerInput.groupFolder}`);
+      }
+    } catch (err) {
+      log(`Failed to load MCP config: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
@@ -486,7 +516,7 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, resumeAt);
+      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, resumeAt, externalMcpServers, externalMcpToolPatterns);
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
